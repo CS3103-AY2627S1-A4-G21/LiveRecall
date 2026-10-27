@@ -9,10 +9,10 @@
  *
  * Graded TODOs:
  *   - replace revisions rather than appending duplicates (done)
- *   - maintain >=60 s of finalized local state
- *   - implement 30 s default recall + 15/30/60 s views
+ *   - maintain >=60 s of finalized local state (done)
+ *   - implement 30 s default recall + 15/30/60 s views (done)
  *   - automatic reconnect + correct resume state
- *   - HISTORY merge/deduplication
+ *   - HISTORY merge/deduplication (done)
  *   - usable final UI
  */
 
@@ -23,6 +23,10 @@ const recallEl = document.getElementById("recall");
 
 let ws;
 const liveCaptions = new Map();
+const finalizedHistory = new Map();
+const HISTORY_SECONDS = 60;
+let recallSeconds = 30;
+let recallOpen = false;
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -32,6 +36,34 @@ function numericClientId() {
     sessionStorage.setItem(key, value);
   }
   return Number(value);
+}
+
+function pruneCaptions() {
+  const cutoff = Date.now() / 1000 - HISTORY_SECONDS;
+
+  for (const [segment, caption] of finalizedHistory) {
+    if (caption.source_ts < cutoff) {
+      finalizedHistory.delete(segment);
+    }
+  }
+}
+
+function showRecall() {
+  const now = Date.now() / 1000;
+  const captions = [...finalizedHistory.entries()]
+    .filter(([, caption]) =>
+      caption.source_ts >= now - recallSeconds &&
+      caption.source_ts <= now
+    )
+    .sort(([a], [b]) => a - b)
+    .map(([, caption]) => caption.text);
+
+  if (captions.length === 0) {
+    recallEl.textContent =
+      "No finalized captions in the previous " + recallSeconds + " seconds.";
+  } else {
+    recallEl.textContent = captions.join("\n");
+  }
 }
 
 function renderCaption(msg) {
@@ -60,10 +92,22 @@ function renderCaption(msg) {
     state = "PROVISIONAL";
   }
 
-  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+  row.textContent =
+    `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
 
   if (!current) {
-    liveEl.appendChild(row);
+    // Recovered captions may precede captions already displayed.
+    let nextRow = null;
+    let nextSegment = Infinity;
+
+    for (const [segment, caption] of liveCaptions) {
+      if (segment > msg.segment && segment < nextSegment) {
+        nextSegment = segment;
+        nextRow = caption.row;
+      }
+    }
+
+    liveEl.insertBefore(row, nextRow);
   }
 
   liveCaptions.set(msg.segment, {
@@ -71,6 +115,16 @@ function renderCaption(msg) {
     final: msg.final,
     row
   });
+
+  // Store only recent finalized captions for local recall.
+  const cutoff = Date.now() / 1000 - HISTORY_SECONDS;
+
+  if (msg.final && msg.source_ts >= cutoff) {
+    finalizedHistory.set(msg.segment, {
+      text: msg.text,
+      source_ts: msg.source_ts
+    });
+  }
 
   liveEl.scrollTop = liveEl.scrollHeight;
 }
@@ -87,17 +141,27 @@ function connect() {
       session: "L1",
       last_segment: 0,       // TODO: resume latest finalized state
       last_revision: 0,
-      history_seconds: 30
+      history_seconds: 60
     }));
   });
 
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
+
     if (msg.type === "CAPTION_UPDATE") {
       renderCaption(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // TODO: merge history without stale/duplicate final captions.
+
+      for (const item of msg.items) {
+        renderCaption(item);
+      }
+    }
+
+    pruneCaptions();
+
+    if (recallOpen) {
+      showRecall();
     }
   });
 
@@ -113,9 +177,21 @@ function connect() {
 
 for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
-    const seconds = Number(button.dataset.seconds);
-    recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
+    recallSeconds = Number(button.dataset.seconds);
+    recallOpen = true;
+    pruneCaptions();
+    showRecall();
   });
 }
+
+// Expire recall history even when no new messages arrive.
+// Previously displayed live captions remain on the page.
+setInterval(() => {
+  pruneCaptions();
+
+  if (recallOpen) {
+    showRecall();
+  }
+}, 1000);
 
 connect();
