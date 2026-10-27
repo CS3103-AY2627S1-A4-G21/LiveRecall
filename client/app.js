@@ -8,7 +8,7 @@
  *   - displays whether an update is provisional/final
  *
  * Graded TODOs:
- *   - replace revisions rather than appending duplicates
+ *   - replace revisions rather than appending duplicates (done)
  *   - maintain >=60 s of finalized local state
  *   - implement 30 s default recall + 15/30/60 s views
  *   - automatic reconnect + correct resume state
@@ -22,6 +22,7 @@ const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 
 let ws;
+const liveCaptions = new Map();
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -33,12 +34,44 @@ function numericClientId() {
   return Number(value);
 }
 
-function appendNaively(msg) {
-  const row = document.createElement("div");
+function renderCaption(msg) {
+  const current = liveCaptions.get(msg.segment);
+
+  if (current) {
+    // Ignore updates to finalized captions and duplicate or older revisions.
+    if (current.final || msg.revision <= current.revision) {
+      return;
+    }
+  }
+
+  let row;
+  if (current) {
+    row = current.row;
+  } else {
+    row = document.createElement("div");
+  }
+
   row.className = "naive-line";
-  const state = msg.final ? "FINAL" : "PROVISIONAL";
+
+  let state;
+  if (msg.final) {
+    state = "FINAL";
+  } else {
+    state = "PROVISIONAL";
+  }
+
   row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
-  liveEl.appendChild(row);
+
+  if (!current) {
+    liveEl.appendChild(row);
+  }
+
+  liveCaptions.set(msg.segment, {
+    revision: msg.revision,
+    final: msg.final,
+    row
+  });
+
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
@@ -61,7 +94,7 @@ function connect() {
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "CAPTION_UPDATE") {
-      appendNaively(msg);
+      renderCaption(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
       // TODO: merge history without stale/duplicate final captions.
