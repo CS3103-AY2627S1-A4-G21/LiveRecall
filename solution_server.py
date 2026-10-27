@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 import json
 import time
 from typing import Any
+from unittest import result
 
 import websockets
 
@@ -205,6 +206,10 @@ class SessionState:
             now = time.time()
 
         effective_window = min(60.0, max(0.0, history_seconds))
+
+        if effective_window == 0:
+            return []
+
         cutoff = now - effective_window
 
         result = []
@@ -214,6 +219,7 @@ class SessionState:
                     item.segment == last_segment and item.revision > last_revision
                 ):
                     result.append(dict(item.raw_msg))
+        result.sort(key=lambda item: (item["segment"], item["revision"]))
         return result
 
 
@@ -282,29 +288,71 @@ def prune_history(now: float | None = None) -> None:
     STATE.prune_history(now=now)
 
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+MAX_PENDING_MESSAGES = 256
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
-        return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
+@dataclass(eq=False)
+class ClientConnection:
+    ws: Any
+    session: str
+    queue: asyncio.Queue[str] = field(
+        default_factory=lambda: asyncio.Queue(
+            maxsize=MAX_PENDING_MESSAGES
+        )
     )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
+    closing: bool = False
+    close_task: asyncio.Task | None = None
+
+
+CLIENTS: set[ClientConnection] = set()
+
+async def client_sender(client: ClientConnection) -> None:
+    """Send this connection's queued messages in order."""
+    try:
+        while True:
+            message = await client.queue.get()
+
+            try:
+                await client.ws.send(message)
+            finally:
+                client.queue.task_done()
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+
+    except Exception:
+        # Closing the socket also wakes handle_client's receive loop,
+        # allowing its cleanup block to run.
+        await client.ws.close(
+            code=1011,
+            reason="Client sender failed",
+        )
+
+
+def enqueue_live_update(
+    session: str,
+    raw_message: str,
+) -> None:
+    """Queue an accepted update without waiting for network sends."""
+    for client in tuple(CLIENTS):
+        if client.closing or client.session != session:
+            continue
+
+        try:
+            client.queue.put_nowait(raw_message)
+
+        except asyncio.QueueFull:
+            # Explicit temporary overflow policy:
+            # disconnect this client so it can reconnect and recover.
+            client.closing = True
             CLIENTS.discard(client)
+
+            client.close_task = asyncio.create_task(
+                client.ws.close(
+                    code=1013,
+                    reason="Client backlog full; reconnect to recover",
+                )
+            )
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
@@ -323,10 +371,15 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 if "session" not in msg and session:
                     msg["session"] = session
 
-                # Validate and track revision state; ignore duplicates/stale updates
-                if accept_caption(msg, raw_json=raw):
-                    # Broadcast only accepted updates to connected clients
-                    await broadcast_naively(raw)
+                # Serialize after adding the session if necessary.
+                outgoing = json.dumps(msg)
+
+                # Accept/store once, then enqueue only accepted updates.
+                if accept_caption(msg, raw_json=outgoing):
+                    enqueue_live_update(
+                        session=str(msg.get("session") or "L1"),
+                        raw_message=outgoing,
+                    )
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -342,21 +395,133 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
+    session = hello.get("session") or "L1"
 
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    last_segment = hello.get("last_segment", 0)
+    last_revision = hello.get("last_revision", 0)
+    history_seconds = hello.get("history_seconds", 30)
+
+    # Cursor values must be nonnegative integers.
+    # Using type(...) is int also rejects JSON booleans.
+    valid_cursor = (
+        type(last_segment) is int
+        and type(last_revision) is int
+        and last_segment >= 0
+        and last_revision >= 0
+    )
+
+    if not valid_cursor:
+        await ws.close(code=1008, reason="Invalid resume cursor")
+        return
+
+    # (0, 0) means no finalized state.
+    # Otherwise, both segment and revision must be positive.
+    if (last_segment == 0) != (last_revision == 0):
+        await ws.close(
+            code=1008,
+            reason="Resume cursor must be (0, 0) or two positive integers",
+        )
+        return
+
+    # Accept numeric history windows between 0 and 60 seconds.
+    # This comparison also rejects NaN and infinity.
+    if (
+        type(history_seconds) not in (int, float)
+        or not 0 <= history_seconds <= 60
+    ):
+        await ws.close(
+            code=1008,
+            reason="history_seconds must be between 0 and 60",
+        )
+        return
+
+    history_seconds = float(history_seconds)
+
+    client = ClientConnection(
+        ws=ws,
+        session=session,
+    )
+
+    # Snapshot creation and registration must not suspend.
+    now = time.time()
+    prune_history(now)
+
+    items = STATE.get_history(
+        session_id=session,
+        last_segment=last_segment,
+        last_revision=last_revision,
+        history_seconds=history_seconds,
+        now=now,
+    )
+
+    # The first application message is always HISTORY,
+    # including when its items list is empty.
+    client.queue.put_nowait(json.dumps({
+        "type": "HISTORY",
+        "items": items,
+    }))
+
+    # Send active provisional state separately from HISTORY.
+    session_state = STATE.sessions.get(session)
+
+    if session_state is not None:
+        active = session_state.segments.get(
+            session_state.latest_active_segment
+        )
+
+        if active is not None and not active.final:
+            client.queue.put_nowait(
+                json.dumps(dict(active.raw_msg))
+            )
+
+    # Register before allowing another coroutine to run.
+    CLIENTS.add(client)
+
+    # The sender now owns all application-message sends.
+    sender_task = asyncio.create_task(client_sender(client))
+
+    print(
+        f"client connected: id={client_id}; clients={len(CLIENTS)}",
+        flush=True,
+    )
+
     try:
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+
     finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        client.closing = True
+        CLIENTS.discard(client)
+
+        sender_task.cancel()
+        await asyncio.gather(
+            sender_task,
+            return_exceptions=True,
+        )
+
+        # Finish any overflow-triggered socket close.
+        if client.close_task is not None:
+            await asyncio.gather(
+                client.close_task,
+                return_exceptions=True,
+            )
+
+        # Release queued payloads for this disconnected client.
+        while True:
+            try:
+                client.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                client.queue.task_done()
+
+        print(
+            f"client disconnected: id={client_id}; clients={len(CLIENTS)}",
+            flush=True,
+        )
 
 
 async def handler(ws) -> None:
