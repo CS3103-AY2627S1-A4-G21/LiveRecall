@@ -24,9 +24,8 @@ const recallEl = document.getElementById("recall");
 let ws;
 const liveCaptions = new Map();
 const finalizedHistory = new Map();
-const HISTORY_SECONDS = 60;
+const HISTORY_SECONDS = 70;
 let recallSeconds = 30;
-let recallOpen = false;
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -46,6 +45,13 @@ function pruneCaptions() {
       finalizedHistory.delete(segment);
     }
   }
+
+  for (const [segment, caption] of liveCaptions) {
+    if (caption.source_ts < cutoff) {
+      caption.row.remove();
+      liveCaptions.delete(segment);
+    }
+  }
 }
 
 function showRecall() {
@@ -53,7 +59,7 @@ function showRecall() {
   const captions = [...finalizedHistory.entries()]
     .filter(([, caption]) =>
       caption.source_ts >= now - recallSeconds &&
-      caption.source_ts <= now
+      caption.source_ts <= now + 1
     )
     .sort(([a], [b]) => a - b)
     .map(([, caption]) => caption.text);
@@ -67,6 +73,11 @@ function showRecall() {
 }
 
 function renderCaption(msg) {
+  // Do not recreate expired rows from old recovery messages.
+  if (msg.source_ts < Date.now() / 1000 - HISTORY_SECONDS) {
+    return;
+  }
+
   const current = liveCaptions.get(msg.segment);
 
   if (current) {
@@ -113,6 +124,7 @@ function renderCaption(msg) {
   liveCaptions.set(msg.segment, {
     revision: msg.revision,
     final: msg.final,
+    source_ts: msg.source_ts,
     row
   });
 
@@ -159,10 +171,6 @@ function connect() {
     }
 
     pruneCaptions();
-
-    if (recallOpen) {
-      showRecall();
-    }
   });
 
   ws.addEventListener("close", () => {
@@ -178,20 +186,12 @@ function connect() {
 for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
     recallSeconds = Number(button.dataset.seconds);
-    recallOpen = true;
     pruneCaptions();
     showRecall();
   });
 }
 
-// Expire recall history even when no new messages arrive.
-// Previously displayed live captions remain on the page.
-setInterval(() => {
-  pruneCaptions();
-
-  if (recallOpen) {
-    showRecall();
-  }
-}, 1000);
+// Expire stored captions and live rows without changing the recall snapshot.
+setInterval(pruneCaptions, 1000);
 
 connect();
