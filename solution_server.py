@@ -31,6 +31,7 @@ import json
 import time
 from typing import Any
 from unittest import result
+import math
 
 import websockets
 
@@ -391,31 +392,50 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     finally:
         print("source disconnected", flush=True)
 
+def parse_cursor_integer(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Cursor cannot be a boolean")
+
+    if isinstance(value, int):
+        parsed = value
+
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError("Cursor must be a finite whole number")
+        parsed = int(value)
+
+    elif isinstance(value, str):
+        parsed = int(value)
+
+    else:
+        raise ValueError("Unsupported cursor type")
+
+    if parsed < 0:
+        raise ValueError("Cursor cannot be negative")
+
+    return parsed
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
     session = hello.get("session") or "L1"
 
-    last_segment = hello.get("last_segment", 0)
-    last_revision = hello.get("last_revision", 0)
-    history_seconds = hello.get("history_seconds", 30)
-
-    # Cursor values must be nonnegative integers.
-    # Using type(...) is int also rejects JSON booleans.
-    valid_cursor = (
-        type(last_segment) is int
-        and type(last_revision) is int
-        and last_segment >= 0
-        and last_revision >= 0
-    )
-
-    if not valid_cursor:
-        await ws.close(code=1008, reason="Invalid resume cursor")
+    # Convert and validate the finalized resume cursor.
+    try:
+        last_segment = parse_cursor_integer(
+            hello.get("last_segment", 0)
+        )
+        last_revision = parse_cursor_integer(
+            hello.get("last_revision", 0)
+        )
+    except (TypeError, ValueError, OverflowError):
+        await ws.close(
+            code=1008,
+            reason="Resume cursor must contain nonnegative whole numbers",
+        )
         return
 
-    # (0, 0) means no finalized state.
-    # Otherwise, both segment and revision must be positive.
+    # Valid cursor: (0, 0), or two positive integers.
     if (last_segment == 0) != (last_revision == 0):
         await ws.close(
             code=1008,
@@ -423,19 +443,22 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         )
         return
 
-    # Accept numeric history windows between 0 and 60 seconds.
-    # This comparison also rejects NaN and infinity.
-    if (
-        type(history_seconds) not in (int, float)
-        or not 0 <= history_seconds <= 60
-    ):
-        await ws.close(
-            code=1008,
-            reason="history_seconds must be between 0 and 60",
-        )
-        return
+    # Convert the history window, defaulting invalid input to 30 seconds.
+    requested_history = hello.get("history_seconds", 30)
 
-    history_seconds = float(history_seconds)
+    try:
+        if isinstance(requested_history, bool):
+            raise ValueError("History window cannot be a boolean")
+
+        history_seconds = float(requested_history)
+    except (TypeError, ValueError, OverflowError):
+        history_seconds = 30.0
+
+    if not math.isfinite(history_seconds):
+        history_seconds = 30.0
+
+    # Clamp the window to between 0 and 60 seconds.
+    history_seconds = min(60.0, max(0.0, history_seconds))
 
     client = ClientConnection(
         ws=ws,
