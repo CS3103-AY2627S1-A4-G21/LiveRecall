@@ -289,18 +289,179 @@ def prune_history(now: float | None = None) -> None:
     STATE.prune_history(now=now)
 
 
-MAX_PENDING_MESSAGES = 256
+DEFAULT_QUEUE_CAPACITY: int = 64
+HARD_QUEUE_LIMIT: int = 128
+OVERLOAD_WATERMARK: int = 15
+OVERLOAD_LAG_THRESHOLD: float = 0.250  # 250 ms head-of-line delay
+OVERLOAD_SEND_THRESHOLD: float = 0.050  # 50 ms TCP send delay
+HYSTERESIS_DEPTH: int = 5
+HYSTERESIS_LAG: float = 0.050  # 50 ms
+
+
+@dataclass
+class PendingItem:
+    segment: int
+    revision: int
+    final: bool
+    payload: str
+    enqueued_at: float = field(default_factory=time.time)
+
+
+class CoalescingQueue:
+    """Bounded, semantics-aware per-client queue with strain-aware backpressure.
+
+    - Under normal conditions: Behaves as a strict FIFO, preserving 100% revision coverage.
+    - Under strain (depth >= watermark OR head_age >= 250ms OR send_ema >= 50ms): Obsolete
+      provisional revisions of the same segment are replaced in-place.
+    - Under capacity exhaustion: Oldest unfinalized provisional items are evicted to
+      guarantee delivery of final captions and newest active speech state.
+    - INVARIANT: Final captions are NEVER dropped or overwritten by provisional revisions.
+    """
+
+    def __init__(
+        self,
+        maxsize: int = DEFAULT_QUEUE_CAPACITY,
+        overload_watermark: int = OVERLOAD_WATERMARK,
+    ) -> None:
+        self.maxsize = maxsize
+        self.overload_watermark = overload_watermark
+        self._items: deque[PendingItem] = deque()
+        # Maps segment -> PendingItem for pending provisional updates in _items
+        self._provisional_map: dict[int, PendingItem] = {}
+        self._ready: asyncio.Event = asyncio.Event()
+        self._unfinished_tasks: int = 0
+        self.last_send_duration_ema: float = 0.0
+        self._strained: bool = False
+
+    def task_done(self) -> None:
+        if self._unfinished_tasks > 0:
+            self._unfinished_tasks -= 1
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def empty(self) -> bool:
+        return len(self._items) == 0
+
+    def update_send_metric(self, duration: float) -> None:
+        """Track transport-level backpressure via exponential moving average."""
+        self.last_send_duration_ema = 0.8 * self.last_send_duration_ema + 0.2 * duration
+
+    def is_strained(self) -> bool:
+        """Determines if the client is experiencing network or consumption strain, with hysteresis."""
+        depth = len(self._items)
+        head_age = (time.time() - self._items[0].enqueued_at) if self._items else 0.0
+
+        if not self._strained:
+            # Overload trigger
+            if (
+                depth >= self.overload_watermark
+                or head_age >= OVERLOAD_LAG_THRESHOLD
+                or self.last_send_duration_ema >= OVERLOAD_SEND_THRESHOLD
+            ):
+                self._strained = True
+        else:
+            # Hysteresis recovery trigger: reset to unconstrained only when queue drains
+            if depth <= HYSTERESIS_DEPTH and head_age <= HYSTERESIS_LAG and self.last_send_duration_ema < OVERLOAD_SEND_THRESHOLD:
+                self._strained = False
+
+        return self._strained
+
+    async def get(self) -> str:
+        """Await next serialized payload to transmit (drop-in replacement for asyncio.Queue.get)."""
+        while not self._items:
+            self._ready.clear()
+            await self._ready.wait()
+
+        item = self._items.popleft()
+        if not item.final:
+            self._provisional_map.pop(item.segment, None)
+        self._unfinished_tasks += 1
+        return item.payload
+
+    def get_nowait(self) -> str:
+        """Synchronously pop the next item or raise asyncio.QueueEmpty."""
+        if not self._items:
+            raise asyncio.QueueEmpty()
+        item = self._items.popleft()
+        if not item.final:
+            self._provisional_map.pop(item.segment, None)
+        self._unfinished_tasks += 1
+        return item.payload
+
+    def put_nowait(self, raw_message: str) -> None:
+        """Generic enqueue for initial HISTORY and control messages."""
+        item = PendingItem(segment=0, revision=0, final=True, payload=raw_message)
+        self._items.append(item)
+        self._ready.set()
+
+    def enqueue_caption(
+        self,
+        segment: int,
+        revision: int,
+        is_final: bool,
+        payload: str,
+    ) -> bool:
+        """Non-blocking semantic enqueue for caption updates. Returns False if hard ceiling exceeded."""
+        # 1. IN-PLACE COALESCING: If an unsent provisional revision for this segment is already waiting
+        if segment in self._provisional_map:
+            pending = self._provisional_map[segment]
+            pending.revision = revision
+            pending.final = is_final
+            pending.payload = payload
+            pending.enqueued_at = time.time()  # Refresh timestamp to newest
+            if is_final:
+                del self._provisional_map[segment]
+            return True
+
+        # 2. FINAL CAPTIONS: Durable state (must be preserved)
+        if is_final:
+            if len(self._items) >= self.maxsize:
+                self._evict_oldest_provisional()
+            # If client is catastrophically behind (> HARD_QUEUE_LIMIT finals), signal overflow
+            if len(self._items) >= HARD_QUEUE_LIMIT:
+                return False
+            item = PendingItem(segment, revision, True, payload)
+            self._items.append(item)
+            self._ready.set()
+            return True
+
+        # 3. PROVISIONAL CAPTIONS:
+        # Normal operation: Queue is healthy and not strained, preserve full revision stream
+        if not self.is_strained():
+            item = PendingItem(segment, revision, False, payload)
+            self._items.append(item)
+            self._provisional_map[segment] = item
+            self._ready.set()
+            return True
+        else:
+            # Under strain: Backpressure detected
+            if len(self._items) >= self.maxsize:
+                # Evict an older provisional update to make room
+                if not self._evict_oldest_provisional():
+                    # If entire queue is full of finals, drop this provisional revision
+                    return True
+            item = PendingItem(segment, revision, False, payload)
+            self._items.append(item)
+            self._provisional_map[segment] = item
+            self._ready.set()
+            return True
+
+    def _evict_oldest_provisional(self) -> bool:
+        """Evict oldest unfinalized provisional item from queue to guarantee room for finals."""
+        for item in list(self._items):
+            if not item.final and item.segment > 0:
+                self._items.remove(item)
+                self._provisional_map.pop(item.segment, None)
+                return True
+        return False
 
 
 @dataclass(eq=False)
 class ClientConnection:
     ws: Any
     session: str
-    queue: asyncio.Queue[str] = field(
-        default_factory=lambda: asyncio.Queue(
-            maxsize=MAX_PENDING_MESSAGES
-        )
-    )
+    queue: CoalescingQueue = field(default_factory=CoalescingQueue)
     closing: bool = False
     close_task: asyncio.Task | None = None
 
@@ -312,9 +473,11 @@ async def client_sender(client: ClientConnection) -> None:
     try:
         while True:
             message = await client.queue.get()
+            t0 = time.time()
 
             try:
                 await client.ws.send(message)
+                client.queue.update_send_metric(time.time() - t0)
             finally:
                 client.queue.task_done()
 
@@ -332,26 +495,31 @@ async def client_sender(client: ClientConnection) -> None:
 
 def enqueue_live_update(
     session: str,
+    segment: int,
+    revision: int,
+    is_final: bool,
     raw_message: str,
 ) -> None:
-    """Queue an accepted update without waiting for network sends."""
+    """Queue an accepted update to matching clients without blocking."""
     for client in tuple(CLIENTS):
         if client.closing or client.session != session:
             continue
 
-        try:
-            client.queue.put_nowait(raw_message)
+        ok = client.queue.enqueue_caption(
+            segment=segment,
+            revision=revision,
+            is_final=is_final,
+            payload=raw_message,
+        )
 
-        except asyncio.QueueFull:
-            # Explicit temporary overflow policy:
-            # disconnect this client so it can reconnect and recover.
+        if not ok:
+            # Catastrophic lag beyond hard ceiling (>128 finals accumulated)
             client.closing = True
             CLIENTS.discard(client)
-
             client.close_task = asyncio.create_task(
                 client.ws.close(
                     code=1013,
-                    reason="Client backlog full; reconnect to recover",
+                    reason="Client lagged beyond recovery limits; reconnect to recover",
                 )
             )
 
@@ -379,6 +547,9 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 if accept_caption(msg, raw_json=outgoing):
                     enqueue_live_update(
                         session=str(msg.get("session") or "L1"),
+                        segment=int(msg["segment"]),
+                        revision=int(msg["revision"]),
+                        is_final=bool(msg.get("final", False)),
                         raw_message=outgoing,
                     )
             elif msg_type == "SOURCE_DONE":
