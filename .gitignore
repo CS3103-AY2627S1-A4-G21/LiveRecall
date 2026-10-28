@@ -19,3 +19,5 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 miniProject_Assignment4_LiveRecall_System.pdf
+demo_results.csv
+demo_results.json
