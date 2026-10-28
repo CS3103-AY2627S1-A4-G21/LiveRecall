@@ -11,21 +11,28 @@
  *   - replace revisions rather than appending duplicates (done)
  *   - maintain >=60 s of finalized local state (done)
  *   - implement 30 s default recall + 15/30/60 s views (done)
- *   - automatic reconnect + correct resume state
+ *   - automatic reconnect + correct resume state (done)
  *   - HISTORY merge/deduplication (done)
  *   - usable final UI
  */
 
 const WS_URL = "ws://127.0.0.1:8765";
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 5000;
+const RECONNECT_JITTER_MS = 250;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 
 let ws;
+let reconnectAttempts = 0;
 const liveCaptions = new Map();
 const finalizedHistory = new Map();
 const HISTORY_SECONDS = 70;
 let recallSeconds = 30;
+
+// Latest finalized state held locally, sent as the resume cursor.
+let lastFinal = { segment: 0, revision: 0 };
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -136,50 +143,86 @@ function renderCaption(msg) {
       text: msg.text,
       source_ts: msg.source_ts
     });
+
+    // Never move the resume cursor backwards.
+    if (msg.segment > lastFinal.segment) {
+      lastFinal = { segment: msg.segment, revision: msg.revision };
+    }
   }
 
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
+function scheduleReconnect() {
+  // Back off exponentially, with jitter so clients do not retry in lockstep.
+  const delay =
+    Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts) +
+    Math.random() * RECONNECT_JITTER_MS;
+  reconnectAttempts += 1;
+
+  statusEl.textContent =
+    `reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${reconnectAttempts})`;
+  setTimeout(connect, delay);
+}
+
 function connect() {
   statusEl.textContent = "connecting";
-  ws = new WebSocket(WS_URL);
+  const socket = new WebSocket(WS_URL);
+  ws = socket;
+  let openedAt;
 
-  ws.addEventListener("open", () => {
-    statusEl.textContent = "connected";
-    ws.send(JSON.stringify({
+  socket.addEventListener("open", () => {
+    // Ignore events from a socket that has been replaced.
+    if (socket !== ws) {
+      return;
+    }
+
+    openedAt = performance.now();
+    statusEl.textContent = "recovering";
+    socket.send(JSON.stringify({
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: 0,       // TODO: resume latest finalized state
-      last_revision: 0,
+      last_segment: lastFinal.segment,
+      last_revision: lastFinal.revision,
       history_seconds: 60
     }));
   });
 
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
+    if (socket !== ws) {
+      return;
+    }
+
     const msg = JSON.parse(event.data);
 
     if (msg.type === "CAPTION_UPDATE") {
       renderCaption(msg);
     } else if (msg.type === "HISTORY") {
-      console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-
       for (const item of msg.items) {
         renderCaption(item);
       }
+
+      // Recovery is complete once HISTORY has been applied.
+      reconnectAttempts = 0;
+      statusEl.textContent = "live";
+      console.log(
+        `HISTORY with ${msg.items.length} item(s), recovered in ` +
+        `${Math.round(performance.now() - openedAt)} ms`,
+        msg
+      );
     }
 
     pruneCaptions();
   });
 
-  ws.addEventListener("close", () => {
-    statusEl.textContent = "disconnected";
-    // TODO: automatic reconnect after a short delay, using finalized resume state.
-  });
+  // The browser always fires close after error, so only close reconnects.
+  socket.addEventListener("close", () => {
+    if (socket !== ws) {
+      return;
+    }
 
-  ws.addEventListener("error", () => {
-    statusEl.textContent = "connection error";
+    scheduleReconnect();
   });
 }
 
