@@ -296,6 +296,10 @@ OVERLOAD_LAG_THRESHOLD: float = 0.250  # 250 ms head-of-line delay
 OVERLOAD_SEND_THRESHOLD: float = 0.050  # 50 ms TCP send delay
 HYSTERESIS_DEPTH: int = 5
 HYSTERESIS_LAG: float = 0.050  # 50 ms
+# Flow control: at most FLOW_WINDOW messages may be sent to a client before a pong confirms
+# it has read them. A WebSocket peer answers a ping only after reading everything sent before
+# it, so each pong is a cumulative acknowledgement.
+FLOW_WINDOW: int = 4
 
 
 @dataclass
@@ -311,8 +315,9 @@ class CoalescingQueue:
     """Bounded, semantics-aware per-client queue with strain-aware backpressure.
 
     - Under normal conditions: Behaves as a strict FIFO, preserving 100% revision coverage.
-    - Under strain (depth >= watermark OR head_age >= 250ms OR send_ema >= 50ms): Obsolete
-      provisional revisions of the same segment are replaced in-place.
+    - Under strain (depth >= watermark OR head_age >= 250ms OR send_ema >= 50ms OR the
+      client's flow window is full): Obsolete provisional revisions of the same segment
+      are replaced in-place.
     - Under capacity exhaustion: Oldest unfinalized provisional items are evicted to
       guarantee delivery of final captions and newest active speech state.
     - INVARIANT: Final captions are NEVER dropped or overwritten by provisional revisions.
@@ -332,6 +337,8 @@ class CoalescingQueue:
         self._unfinished_tasks: int = 0
         self.last_send_duration_ema: float = 0.0
         self._strained: bool = False
+        # Set by client_sender while the client has FLOW_WINDOW unconfirmed messages
+        self.flow_blocked: bool = False
 
     def task_done(self) -> None:
         if self._unfinished_tasks > 0:
@@ -358,11 +365,17 @@ class CoalescingQueue:
                 depth >= self.overload_watermark
                 or head_age >= OVERLOAD_LAG_THRESHOLD
                 or self.last_send_duration_ema >= OVERLOAD_SEND_THRESHOLD
+                or self.flow_blocked
             ):
                 self._strained = True
         else:
             # Hysteresis recovery trigger: reset to unconstrained only when queue drains
-            if depth <= HYSTERESIS_DEPTH and head_age <= HYSTERESIS_LAG and self.last_send_duration_ema < OVERLOAD_SEND_THRESHOLD:
+            if (
+                depth <= HYSTERESIS_DEPTH
+                and head_age <= HYSTERESIS_LAG
+                and self.last_send_duration_ema < OVERLOAD_SEND_THRESHOLD
+                and not self.flow_blocked
+            ):
                 self._strained = False
 
         return self._strained
@@ -474,14 +487,46 @@ class ClientConnection:
     queue: CoalescingQueue = field(default_factory=CoalescingQueue)
     closing: bool = False
     close_task: asyncio.Task | None = None
+    # Flow control: messages sent, messages confirmed by a pong, and whether a ping is in flight
+    sent: int = 0
+    acked: int = 0
+    ping_pending: bool = False
+    window_open: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 CLIENTS: set[ClientConnection] = set()
 
+
+async def send_flow_ping(client: ClientConnection) -> None:
+    """Ping the client; its pong confirms every message sent before the ping."""
+    sent_at_ping = client.sent
+    pong_received = await client.ws.ping()
+    client.ping_pending = True
+
+    def on_pong(fut: asyncio.Future) -> None:
+        client.ping_pending = False
+        # Pending pings fail with ConnectionClosed when the socket closes
+        if not fut.cancelled() and fut.exception() is None:
+            client.acked = max(client.acked, sent_at_ping)
+        client.window_open.set()
+
+    pong_received.add_done_callback(on_pong)
+
+
 async def client_sender(client: ClientConnection) -> None:
-    """Send this connection's queued messages in order."""
+    """Send this connection's queued messages in order, at most FLOW_WINDOW ahead of the client."""
     try:
         while True:
+            # Wait for room in the window *before* taking a message: while the client is
+            # behind, new revisions stay in the queue, where they can still be coalesced.
+            while client.sent - client.acked >= FLOW_WINDOW:
+                client.queue.flow_blocked = True
+                if not client.ping_pending:
+                    await send_flow_ping(client)
+                client.window_open.clear()
+                await client.window_open.wait()
+            client.queue.flow_blocked = False
+
             message = await client.queue.get()
             t0 = time.time()
 
@@ -490,6 +535,10 @@ async def client_sender(client: ClientConnection) -> None:
                 client.queue.update_send_metric(time.time() - t0)
             finally:
                 client.queue.task_done()
+
+            client.sent += 1
+            if not client.ping_pending:
+                await send_flow_ping(client)
 
     except websockets.exceptions.ConnectionClosed:
         pass
