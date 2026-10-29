@@ -374,8 +374,7 @@ class CoalescingQueue:
             await self._ready.wait()
 
         item = self._items.popleft()
-        if not item.final:
-            self._provisional_map.pop(item.segment, None)
+        self._untrack(item)
         self._unfinished_tasks += 1
         return item.payload
 
@@ -384,8 +383,7 @@ class CoalescingQueue:
         if not self._items:
             raise asyncio.QueueEmpty()
         item = self._items.popleft()
-        if not item.final:
-            self._provisional_map.pop(item.segment, None)
+        self._untrack(item)
         self._unfinished_tasks += 1
         return item.payload
 
@@ -403,8 +401,9 @@ class CoalescingQueue:
         payload: str,
     ) -> bool:
         """Non-blocking semantic enqueue for caption updates. Returns False if hard ceiling exceeded."""
-        # 1. IN-PLACE COALESCING: If an unsent provisional revision for this segment is already waiting
-        if segment in self._provisional_map:
+        # 1. IN-PLACE COALESCING: Only under strain, replace an unsent provisional revision for this segment.
+        # A healthy client keeps every revision, even when a burst queues several before its sender runs.
+        if segment in self._provisional_map and self.is_strained():
             pending = self._provisional_map[segment]
             pending.revision = revision
             pending.final = is_final
@@ -421,6 +420,8 @@ class CoalescingQueue:
             # If client is catastrophically behind (> HARD_QUEUE_LIMIT finals), signal overflow
             if len(self._items) >= HARD_QUEUE_LIMIT:
                 return False
+            # Queued behind any unsent provisional of this segment, so nothing may coalesce ahead of it
+            self._provisional_map.pop(segment, None)
             item = PendingItem(segment, revision, True, payload)
             self._items.append(item)
             self._ready.set()
@@ -452,9 +453,18 @@ class CoalescingQueue:
         for item in list(self._items):
             if not item.final and item.segment > 0:
                 self._items.remove(item)
-                self._provisional_map.pop(item.segment, None)
+                self._untrack(item)
                 return True
         return False
+
+    def _untrack(self, item: PendingItem) -> None:
+        """Forget item as its segment's newest unsent provisional, if it still is.
+
+        Without strain a segment may have several queued revisions; the map must keep
+        pointing at the newest one when an older one is sent or evicted.
+        """
+        if self._provisional_map.get(item.segment) is item:
+            del self._provisional_map[item.segment]
 
 
 @dataclass(eq=False)
