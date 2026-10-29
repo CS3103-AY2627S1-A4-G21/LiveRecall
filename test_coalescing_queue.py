@@ -34,8 +34,10 @@ class TestCoalescingQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.qsize(), 0)
 
     async def test_in_place_coalescing(self):
-        """When an unsent provisional revision is in the queue, newer revisions replace it in-place."""
+        """Under strain, newer revisions replace an unsent provisional revision in-place."""
         q = CoalescingQueue(maxsize=10, overload_watermark=5)
+        # Simulate slow transport sends so the queue is strained
+        q.update_send_metric(1.0)
 
         # Enqueue seg 1 rev 1, then seg 2 rev 1
         q.enqueue_caption(1, 1, False, "seg1_rev1")
@@ -59,6 +61,46 @@ class TestCoalescingQueue(unittest.IsolatedAsyncioTestCase):
         msg2 = await q.get()
         q.task_done()
         self.assertEqual(msg2, "seg2_rev1")
+
+    async def test_burst_without_strain_keeps_every_revision(self):
+        """A healthy client receives every revision, even when a burst queues them before the sender runs."""
+        q = CoalescingQueue(maxsize=10, overload_watermark=5)
+
+        q.enqueue_caption(1, 1, False, "seg1_rev1")
+        q.enqueue_caption(1, 2, False, "seg1_rev2")
+        q.enqueue_caption(1, 3, True, "seg1_rev3_final")
+        self.assertEqual(q.qsize(), 3)
+
+        items = [await q.get(), await q.get(), await q.get()]
+        self.assertEqual(items, ["seg1_rev1", "seg1_rev2", "seg1_rev3_final"])
+
+    async def test_coalescing_after_sending_older_revision(self):
+        """Sending an older revision must not stop a newer queued revision of the same segment from coalescing."""
+        q = CoalescingQueue(maxsize=10, overload_watermark=5)
+
+        # Burst while healthy: both revisions are queued
+        q.enqueue_caption(1, 1, False, "seg1_rev1")
+        q.enqueue_caption(1, 2, False, "seg1_rev2")
+        self.assertEqual(await q.get(), "seg1_rev1")
+        q.task_done()
+
+        # Strain begins; the final replaces the still-unsent rev 2
+        q.update_send_metric(1.0)
+        q.enqueue_caption(1, 3, True, "seg1_rev3_final")
+        self.assertEqual(q.qsize(), 1)
+        self.assertEqual(await q.get(), "seg1_rev3_final")
+
+    async def test_newer_revision_never_overtakes_queued_final(self):
+        """Once a final is queued, later updates of that segment must not coalesce into an earlier slot."""
+        q = CoalescingQueue(maxsize=10, overload_watermark=5)
+        q.enqueue_caption(1, 1, False, "seg1_rev1")
+        q.enqueue_caption(1, 2, True, "seg1_rev2_final")
+
+        q.update_send_metric(1.0)
+        q.enqueue_caption(1, 3, True, "seg1_rev3_final")
+
+        items = [await q.get(), await q.get(), await q.get()]
+        self.assertEqual(items, ["seg1_rev1", "seg1_rev2_final", "seg1_rev3_final"])
 
     async def test_final_captions_never_dropped(self):
         """Final captions are durable state and must never be evicted, even at capacity."""
