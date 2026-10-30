@@ -300,6 +300,16 @@ HYSTERESIS_LAG: float = 0.050  # 50 ms
 # it has read them. A WebSocket peer answers a ping only after reading everything sent before
 # it, so each pong is a cumulative acknowledgement.
 FLOW_WINDOW: int = 4
+# Slow-reader detection. A pong's latency is the client's network round trip plus any time the
+# ping waited behind unread messages. Compared with the client's own minimum round trip, a lost
+# packet adds a few round trips while a slow reader's backlog adds seconds. A pong slower than
+# SLOW_RTT_FACTOR x the minimum (and above SLOW_MIN_LATENCY, half the 500 ms freshness
+# threshold, below which captions are still fresh) puts the client in slow mode: final captions
+# only, until SLOW_EXIT_MESSAGES further messages are confirmed without another slow pong.
+SLOW_RTT_FACTOR: float = 10.0
+SLOW_MIN_LATENCY: float = 0.250
+MIN_RTT_SAMPLES: int = 3
+SLOW_EXIT_MESSAGES: int = 50
 
 
 @dataclass
@@ -487,27 +497,51 @@ class ClientConnection:
     queue: CoalescingQueue = field(default_factory=CoalescingQueue)
     closing: bool = False
     close_task: asyncio.Task | None = None
-    # Flow control: messages sent, messages confirmed by a pong, and whether a ping is in flight
+    # Flow control: messages sent, and messages confirmed by a pong
     sent: int = 0
     acked: int = 0
-    ping_pending: bool = False
     window_open: asyncio.Event = field(default_factory=asyncio.Event)
+    # Slow-reader detection (see SLOW_RTT_FACTOR)
+    min_rtt: float = math.inf
+    rtt_samples: int = 0
+    slow_mode: bool = False
+    confirmed_since_slow: int = 0
 
 
 CLIENTS: set[ClientConnection] = set()
+
+
+def record_pong(client: ClientConnection, sent_at_ping: int, latency: float) -> None:
+    """Update flow-control and slow-reader state from one answered ping."""
+    newly_confirmed = max(0, sent_at_ping - client.acked)
+    client.acked = max(client.acked, sent_at_ping)
+
+    slow_pong = (
+        client.rtt_samples >= MIN_RTT_SAMPLES
+        and latency > SLOW_MIN_LATENCY
+        and latency > SLOW_RTT_FACTOR * client.min_rtt
+    )
+    client.min_rtt = min(client.min_rtt, latency)
+    client.rtt_samples += 1
+
+    if slow_pong:
+        client.slow_mode = True
+        client.confirmed_since_slow = 0
+    elif client.slow_mode:
+        client.confirmed_since_slow += newly_confirmed
+        if client.confirmed_since_slow >= SLOW_EXIT_MESSAGES:
+            client.slow_mode = False
 
 
 async def send_flow_ping(client: ClientConnection) -> None:
     """Ping the client; its pong confirms every message sent before the ping."""
     sent_at_ping = client.sent
     pong_received = await client.ws.ping()
-    client.ping_pending = True
 
     def on_pong(fut: asyncio.Future) -> None:
-        client.ping_pending = False
         # Pending pings fail with ConnectionClosed when the socket closes
         if not fut.cancelled() and fut.exception() is None:
-            client.acked = max(client.acked, sent_at_ping)
+            record_pong(client, sent_at_ping, fut.result())
         client.window_open.set()
 
     pong_received.add_done_callback(on_pong)
@@ -521,8 +555,6 @@ async def client_sender(client: ClientConnection) -> None:
             # behind, new revisions stay in the queue, where they can still be coalesced.
             while client.sent - client.acked >= FLOW_WINDOW:
                 client.queue.flow_blocked = True
-                if not client.ping_pending:
-                    await send_flow_ping(client)
                 client.window_open.clear()
                 await client.window_open.wait()
             client.queue.flow_blocked = False
@@ -537,8 +569,8 @@ async def client_sender(client: ClientConnection) -> None:
                 client.queue.task_done()
 
             client.sent += 1
-            if not client.ping_pending:
-                await send_flow_ping(client)
+            # Ping after every message, so a pong always covers everything sent so far
+            await send_flow_ping(client)
 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -562,6 +594,11 @@ def enqueue_live_update(
     """Queue an accepted update to matching clients without blocking."""
     for client in tuple(CLIENTS):
         if client.closing or client.session != session:
+            continue
+
+        # A slow reader would read a provisional seconds after its final exists; spend its
+        # limited reads on final captions instead
+        if not is_final and client.slow_mode:
             continue
 
         ok = client.queue.enqueue_caption(
