@@ -1,19 +1,14 @@
 /*
- * Working but deliberately naive LiveRecall browser starter.
+ * LiveRecall browser client.
  *
- * Provided mechanical behavior:
- *   - opens a WebSocket
- *   - sends CLIENT_HELLO
- *   - visibly appends every received CAPTION_UPDATE
- *   - displays whether an update is provisional/final
- *
- * Graded TODOs:
- *   - replace revisions rather than appending duplicates (done)
- *   - maintain >=60 s of finalized local state (done)
- *   - implement 30 s default recall + 15/30/60 s views (done)
- *   - automatic reconnect + correct resume state (done)
- *   - HISTORY merge/deduplication (done)
- *   - usable final UI
+ * Implemented behaviors:
+ *   - opens a WebSocket connection and registers via CLIENT_HELLO
+ *   - replaces in-place provisional caption revisions
+ *   - maintains rolling history of finalized captions (>=60s)
+ *   - provides local "What did I miss?" recall (15/30/60s)
+ *   - automatic reconnect with exponential backoff & jitter
+ *   - resume cursor tracking to avoid replaying history
+ *   - visually distinguishes provisional vs final captions
  */
 
 const WS_URL = "ws://127.0.0.1:8765";
@@ -101,7 +96,7 @@ function renderCaption(msg) {
     row = document.createElement("div");
   }
 
-  row.className = `naive-line ${msg.final ? "caption-final" : "caption-provisional"}`;
+  row.className = `caption-row ${msg.final ? "caption-final" : "caption-provisional"}`;
 
   const badge = document.createElement("span");
   badge.className = `badge ${msg.final ? "badge-final" : "badge-provisional"}`;
