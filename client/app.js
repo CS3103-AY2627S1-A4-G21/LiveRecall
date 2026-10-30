@@ -101,17 +101,26 @@ function renderCaption(msg) {
     row = document.createElement("div");
   }
 
-  row.className = "naive-line";
+  row.className = `naive-line ${msg.final ? "caption-final" : "caption-provisional"}`;
 
-  let state;
-  if (msg.final) {
-    state = "FINAL";
+  const badge = document.createElement("span");
+  badge.className = `badge ${msg.final ? "badge-final" : "badge-provisional"}`;
+  badge.textContent = msg.final ? "FINAL" : "PROVISIONAL";
+
+  const meta = document.createElement("span");
+  meta.className = "caption-meta";
+  meta.textContent = `seg ${msg.segment} rev ${msg.revision}`;
+
+  const textSpan = document.createElement("span");
+  textSpan.className = "caption-text";
+  textSpan.textContent = msg.text;
+
+  if (typeof row.replaceChildren === "function") {
+    row.replaceChildren(badge, meta, textSpan);
   } else {
-    state = "PROVISIONAL";
+    row.textContent = "";
+    row.append(badge, meta, textSpan);
   }
-
-  row.textContent =
-    `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
 
   if (!current) {
     // Recovered captions may precede captions already displayed.
@@ -135,17 +144,22 @@ function renderCaption(msg) {
     row
   });
 
-  // Store only recent finalized captions for local recall.
+  // Store recent finalized captions for local recall and advance resume cursor.
   const cutoff = Date.now() / 1000 - HISTORY_SECONDS;
 
-  if (msg.final && msg.source_ts >= cutoff) {
-    finalizedHistory.set(msg.segment, {
-      text: msg.text,
-      source_ts: msg.source_ts
-    });
+  if (msg.final) {
+    if (msg.source_ts >= cutoff) {
+      finalizedHistory.set(msg.segment, {
+        text: msg.text,
+        source_ts: msg.source_ts
+      });
+    }
 
-    // Never move the resume cursor backwards.
-    if (msg.segment > lastFinal.segment) {
+    // Never move the resume cursor backwards; update when higher segment or newer revision seen.
+    if (
+      msg.segment > lastFinal.segment ||
+      (msg.segment === lastFinal.segment && msg.revision > lastFinal.revision)
+    ) {
       lastFinal = { segment: msg.segment, revision: msg.revision };
     }
   }
