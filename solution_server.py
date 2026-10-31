@@ -303,12 +303,16 @@ FLOW_WINDOW: int = 4
 # Slow-reader detection. A pong's latency is the client's network round trip plus any time the
 # ping waited behind unread messages. Compared with the client's own minimum round trip, a lost
 # packet adds a few round trips while a slow reader's backlog adds seconds. A pong slower than
-# SLOW_RTT_FACTOR x the minimum (and above SLOW_MIN_LATENCY, half the 500 ms freshness
-# threshold, below which captions are still fresh) puts the client in slow mode: final captions
-# only, until SLOW_EXIT_MESSAGES further messages are confirmed without another slow pong.
+# SLOW_RTT_FACTOR x the minimum (and above SLOW_MIN_LATENCY, half the freshness limit, below
+# which captions are still fresh) puts the client in slow mode: final captions only, until
+# SLOW_EXIT_MESSAGES further messages are confirmed without another slow pong.
+# A link that is congested from the start (e.g. limited bandwidth) also inflates the minimum, so
+# STALE_PONG_STREAK successive round trips slower than FRESHNESS_LIMIT enter slow mode as well.
+FRESHNESS_LIMIT: float = 0.500
 SLOW_RTT_FACTOR: float = 10.0
-SLOW_MIN_LATENCY: float = 0.250
+SLOW_MIN_LATENCY: float = FRESHNESS_LIMIT / 2
 MIN_RTT_SAMPLES: int = 3
+STALE_PONG_STREAK: int = 3
 SLOW_EXIT_MESSAGES: int = 50
 
 
@@ -504,6 +508,9 @@ class ClientConnection:
     # Slow-reader detection (see SLOW_RTT_FACTOR)
     min_rtt: float = math.inf
     rtt_samples: int = 0
+    stale_pongs: int = 0
+    # Value of `sent` when the last counted stale pong arrived
+    stale_pong_mark: int = 0
     slow_mode: bool = False
     confirmed_since_slow: int = 0
 
@@ -524,7 +531,16 @@ def record_pong(client: ClientConnection, sent_at_ping: int, latency: float) -> 
     client.min_rtt = min(client.min_rtt, latency)
     client.rtt_samples += 1
 
-    if slow_pong:
+    if latency > FRESHNESS_LIMIT:
+        # Pings sent during the same stall are delayed together, so count a stale pong only
+        # if its ping was sent after the previous counted one arrived
+        if sent_at_ping > client.stale_pong_mark:
+            client.stale_pongs += 1
+            client.stale_pong_mark = client.sent
+    else:
+        client.stale_pongs = 0
+
+    if slow_pong or client.stale_pongs >= STALE_PONG_STREAK:
         client.slow_mode = True
         client.confirmed_since_slow = 0
     elif client.slow_mode:

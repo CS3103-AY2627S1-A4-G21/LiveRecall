@@ -9,6 +9,7 @@ from solution_server import (
     FLOW_WINDOW,
     MIN_RTT_SAMPLES,
     SLOW_EXIT_MESSAGES,
+    STALE_PONG_STREAK,
     ClientConnection,
     client_sender,
     enqueue_live_update,
@@ -172,6 +173,40 @@ class TestFlowControl(unittest.IsolatedAsyncioTestCase):
         """Without enough round-trip samples there is no baseline, so a slow pong is ignored."""
         await self.start()
         await self.send_one(1, 2.0)
+        self.assertFalse(self.client.slow_mode)
+
+    async def test_stale_round_trips_enter_slow_mode_without_baseline(self):
+        """On a link congested from the start, every pong is slow, so the ratio never fires;
+        STALE_PONG_STREAK successive stale round trips enter slow mode instead."""
+        await self.start()
+        for seg in range(1, STALE_PONG_STREAK):
+            await self.send_one(seg, 1.2)
+            self.assertFalse(self.client.slow_mode)
+
+        await self.send_one(STALE_PONG_STREAK, 1.2)
+        self.assertTrue(self.client.slow_mode)
+
+    async def test_stale_pongs_from_one_stall_count_once(self):
+        """Pings delayed by the same stall (e.g. one retransmitted packet) are one observation."""
+        await self.start()
+        for seg in range(1, STALE_PONG_STREAK + 1):
+            self.client.queue.enqueue_caption(seg, 1, True, f"seg{seg}_final")
+        await self.settle()
+        self.assertEqual(len(self.ws.pings), STALE_PONG_STREAK)
+
+        self.pong(0.7)
+        await self.settle()
+        self.assertEqual(self.client.stale_pongs, 1)
+        self.assertFalse(self.client.slow_mode)
+
+    async def test_fresh_pong_resets_stale_streak(self):
+        """Stale pongs must be consecutive: a fresh one in between means the jam was occasional.
+        The fresh round trip is 200 ms, so 0.7 s is only 3.5x the minimum and the ratio stays quiet."""
+        await self.start()
+        seg = 1
+        for latency in [0.7] * (STALE_PONG_STREAK - 1) + [0.200] + [0.7] * (STALE_PONG_STREAK - 1):
+            await self.send_one(seg, latency)
+            seg += 1
         self.assertFalse(self.client.slow_mode)
 
     async def test_slow_mode_exits_after_confirmed_messages(self):
