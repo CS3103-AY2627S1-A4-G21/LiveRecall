@@ -554,6 +554,9 @@ async def client_sender(client: ClientConnection) -> None:
             # Wait for room in the window *before* taking a message: while the client is
             # behind, new revisions stay in the queue, where they can still be coalesced.
             while client.sent - client.acked >= FLOW_WINDOW:
+                # Also cancelled by handle_client; this just exits sooner
+                if client.closing:
+                    return
                 client.queue.flow_blocked = True
                 client.window_open.clear()
                 await client.window_open.wait()
