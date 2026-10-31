@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Comprehensive test suite for Issue #5: Source caption handling."""
 
+import asyncio
+import json
 import time
 import unittest
+import websockets
 from solution_server import STATE, ServerState, SessionState, accept_caption, prune_history
 
 
@@ -349,6 +352,52 @@ class TestWebSocketServerIntegration(unittest.IsolatedAsyncioTestCase):
                     # Verify SOURCE_DONE is handled gracefully without crashing
                     await source_ws.send(json.dumps({"type": "SOURCE_DONE"}))
                     await asyncio.sleep(0.1)
+
+    async def test_client_hello_cursor_tolerance(self):
+        """Test resume cursor tolerance for omitted revision and invalid inputs (Issue #21)."""
+        from solution_server import handler
+
+        STATE.reset()
+        port = 8790
+        async with websockets.serve(handler, "127.0.0.1", port):
+            uri = f"ws://127.0.0.1:{port}"
+
+            # 1. Connect with last_segment > 0 and omitted last_revision (should succeed, not close with 1008)
+            async with websockets.connect(uri) as client_ws:
+                await client_ws.send(json.dumps({
+                    "type": "CLIENT_HELLO",
+                    "client_id": 101,
+                    "session": "L1",
+                    "last_segment": 5,
+                }))
+                history_raw = await asyncio.wait_for(client_ws.recv(), timeout=2.0)
+                history = json.loads(history_raw)
+                self.assertEqual(history.get("type"), "HISTORY")
+
+            # 2. Connect with last_segment: 0 and last_revision: 5 (should normalize to (0, 0) and succeed)
+            async with websockets.connect(uri) as client_ws:
+                await client_ws.send(json.dumps({
+                    "type": "CLIENT_HELLO",
+                    "client_id": 102,
+                    "session": "L1",
+                    "last_segment": 0,
+                    "last_revision": 5,
+                }))
+                history_raw = await asyncio.wait_for(client_ws.recv(), timeout=2.0)
+                history = json.loads(history_raw)
+                self.assertEqual(history.get("type"), "HISTORY")
+
+            # 3. Connect with negative cursor (should be rejected with 1008)
+            with self.assertRaises(websockets.exceptions.ConnectionClosed) as ctx:
+                async with websockets.connect(uri) as client_ws:
+                    await client_ws.send(json.dumps({
+                        "type": "CLIENT_HELLO",
+                        "client_id": 103,
+                        "session": "L1",
+                        "last_segment": -1,
+                    }))
+                    await client_ws.recv()
+            self.assertEqual(ctx.exception.rcvd.code, 1008)
 
 
 if __name__ == "__main__":

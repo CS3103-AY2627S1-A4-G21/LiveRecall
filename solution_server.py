@@ -616,13 +616,9 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         )
         return
 
-    # Valid cursor: (0, 0), or two positive integers.
-    if (last_segment == 0) != (last_revision == 0):
-        await ws.close(
-            code=1008,
-            reason="Resume cursor must be (0, 0) or two positive integers",
-        )
-        return
+    # Normalize cursor: segment 0 has no revisions; positive segments allow omitted/zero revision.
+    if last_segment == 0:
+        last_revision = 0
 
     # Convert the history window, defaulting invalid input to 30 seconds.
     requested_history = hello.get("history_seconds", 30)
@@ -674,8 +670,11 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         )
 
         if active is not None and not active.final:
-            client.queue.put_nowait(
-                json.dumps(dict(active.raw_msg))
+            client.queue.enqueue_caption(
+                segment=active.segment,
+                revision=active.revision,
+                is_final=False,
+                payload=active.raw_json or json.dumps(dict(active.raw_msg)),
             )
 
     # Register before allowing another coroutine to run.

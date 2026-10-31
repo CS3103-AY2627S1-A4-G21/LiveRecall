@@ -167,6 +167,23 @@ class TestCoalescingQueue(unittest.IsolatedAsyncioTestCase):
         q.update_send_metric(0.080)
         self.assertTrue(q.is_strained())
 
+    async def test_active_provisional_segment_coalescing_under_strain(self):
+        """Active provisional segment enqueued on connection must be tracked and coalesce under strain."""
+        q = CoalescingQueue(maxsize=10, overload_watermark=5)
+
+        # Enqueue initial active provisional segment (Issue #20)
+        q.enqueue_caption(42, 1, False, '{"segment": 42, "revision": 1, "final": false}')
+        self.assertEqual(q.qsize(), 1)
+
+        # Under strain, revision 2 arrives
+        q.update_send_metric(1.0)
+        q.enqueue_caption(42, 2, False, '{"segment": 42, "revision": 2, "final": false}')
+
+        # Must coalesce in-place (size remains 1)
+        self.assertEqual(q.qsize(), 1)
+        self.assertEqual(await q.get(), '{"segment": 42, "revision": 2, "final": false}')
+        q.task_done()
+
 
 if __name__ == "__main__":
     unittest.main()
