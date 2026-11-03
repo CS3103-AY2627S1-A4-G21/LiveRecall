@@ -122,20 +122,50 @@ class TestCoalescingQueue(unittest.IsolatedAsyncioTestCase):
         items = [await q.get(), await q.get(), await q.get()]
         self.assertEqual(items, ["final_1", "final_3", "final_4"])
 
-    async def test_provisional_dropped_when_all_finals(self):
-        """When queue is full of finals, new provisional updates are discarded rather than evicting finals."""
+    async def test_active_provisional_preserved_when_queue_full_of_finals(self):
+        """When queue is full of finals, finals are not evicted and the latest active provisional is preserved."""
         q = CoalescingQueue(maxsize=2, overload_watermark=1)
         q.enqueue_caption(1, 3, True, "final_1")
         q.enqueue_caption(2, 3, True, "final_2")
         self.assertEqual(q.qsize(), 2)
 
         # Enqueue provisional update when full of finals
-        q.enqueue_caption(3, 1, False, "prov_3")
-        self.assertEqual(q.qsize(), 2)
+        q.enqueue_caption(3, 1, False, "prov_3_rev1")
+        self.assertEqual(q.qsize(), 3)
 
-        # Dequeue must still yield only final_1 and final_2
+        # Newer revision for active segment 3 replaces rev 1 in-place in active provisional slot
+        q.enqueue_caption(3, 2, False, "prov_3_rev2")
+        self.assertEqual(q.qsize(), 3)
+
+        # Dequeue must yield finals first, then the preserved latest active provisional
         self.assertEqual(await q.get(), "final_1")
+        q.task_done()
         self.assertEqual(await q.get(), "final_2")
+        q.task_done()
+        self.assertEqual(await q.get(), "prov_3_rev2")
+        q.task_done()
+        self.assertEqual(q.qsize(), 0)
+
+    async def test_active_provisional_superseded_by_final_when_queue_full(self):
+        """When queue is full of finals and active provisional is queued, finalization clears obsolete provisional."""
+        q = CoalescingQueue(maxsize=2, overload_watermark=1)
+        q.enqueue_caption(1, 3, True, "final_1")
+        q.enqueue_caption(2, 3, True, "final_2")
+
+        # Active provisional for segment 3
+        q.enqueue_caption(3, 1, False, "prov_3_rev1")
+        q.enqueue_caption(3, 2, False, "prov_3_rev2")
+
+        # Segment 3 finalizes: final caption is queued, obsolete provisional is cleared
+        q.enqueue_caption(3, 3, True, "final_3")
+
+        self.assertEqual(await q.get(), "final_1")
+        q.task_done()
+        self.assertEqual(await q.get(), "final_2")
+        q.task_done()
+        self.assertEqual(await q.get(), "final_3")
+        q.task_done()
+        self.assertEqual(q.qsize(), 0)
 
     async def test_generic_put_nowait_for_history(self):
         """put_nowait correctly enqueues HISTORY or control messages."""
