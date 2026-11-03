@@ -8,10 +8,10 @@ A semantics-aware, resilient real-time lecture captioning and historical recall 
 
 | Name | Student ID | Main Responsibilities |
 |---|---|---|
-| Lim Kai Wei |  | Server Architecture, State Ingestion, Deduplication & Queue Management |
-| Jansen Ken Pegrasio |  | WebSocket Ping/Pong Flow Window, Latency Tracking & Backpressure Optimization |
-| Christopher Chong Jia Cheng |  | Browser Client UI, Reconnect Logic & Local Recall Caching |
-| Chen Junyao |  | Test Harness, Linux Traffic Control (tc/netem) Impairments & Benchmarks |
+| Lim Kai Wei | A0273249X | Server Architecture, State Ingestion, Deduplication & Queue Management |
+| Jansen Ken Pegrasio | A0305755B | WebSocket Ping/Pong Flow Window, Latency Tracking & Backpressure Optimization |
+| Christopher Chong Jia Cheng | A0273461E | Browser Client UI, Reconnect Logic & Local Recall Caching |
+| Chen Junyao | A0273316H | Test Harness, Linux Traffic Control (tc/netem) Impairments & Benchmarks |
 
 ---
 
