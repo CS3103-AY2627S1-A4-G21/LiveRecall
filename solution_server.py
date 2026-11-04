@@ -332,8 +332,9 @@ class CoalescingQueue:
     - Under strain (depth >= watermark OR head_age >= 250ms OR send_ema >= 50ms OR the
       client's flow window is full): Obsolete provisional revisions of the same segment
       are replaced in-place.
-    - Under capacity exhaustion: Oldest unfinalized provisional items are evicted to
-      guarantee delivery of final captions and newest active speech state.
+    - Under capacity exhaustion or slow mode: Oldest unfinalized provisional items are
+      evicted to guarantee delivery of final captions, while preserving the latest available
+      revision of any currently active segment in a dedicated slot without unbounded queue growth.
     - INVARIANT: Final captions are NEVER dropped or overwritten by provisional revisions.
     """
 
@@ -347,6 +348,8 @@ class CoalescingQueue:
         self._items: deque[PendingItem] = deque()
         # Maps segment -> PendingItem for pending provisional updates in _items
         self._provisional_map: dict[int, PendingItem] = {}
+        # Dedicated slot preserving the latest revision of the currently active segment under overload/slow mode
+        self._active_provisional: PendingItem | None = None
         self._ready: asyncio.Event = asyncio.Event()
         self._unfinished_tasks: int = 0
         self.last_send_duration_ema: float = 0.0
@@ -359,10 +362,10 @@ class CoalescingQueue:
             self._unfinished_tasks -= 1
 
     def qsize(self) -> int:
-        return len(self._items)
+        return len(self._items) + (1 if self._active_provisional is not None else 0)
 
     def empty(self) -> bool:
-        return len(self._items) == 0
+        return len(self._items) == 0 and self._active_provisional is None
 
     def update_send_metric(self, duration: float) -> None:
         """Track transport-level backpressure via exponential moving average."""
@@ -396,23 +399,37 @@ class CoalescingQueue:
 
     async def get(self) -> str:
         """Await next serialized payload to transmit (drop-in replacement for asyncio.Queue.get)."""
-        while not self._items:
+        while not self._items and self._active_provisional is None:
             self._ready.clear()
             await self._ready.wait()
 
-        item = self._items.popleft()
-        self._untrack(item)
-        self._unfinished_tasks += 1
-        return item.payload
+        if self._items:
+            item = self._items.popleft()
+            self._untrack(item)
+            self._unfinished_tasks += 1
+            return item.payload
+        else:
+            item = self._active_provisional
+            self._active_provisional = None
+            self._untrack(item)
+            self._unfinished_tasks += 1
+            return item.payload
 
     def get_nowait(self) -> str:
         """Synchronously pop the next item or raise asyncio.QueueEmpty."""
-        if not self._items:
+        if self._items:
+            item = self._items.popleft()
+            self._untrack(item)
+            self._unfinished_tasks += 1
+            return item.payload
+        elif self._active_provisional is not None:
+            item = self._active_provisional
+            self._active_provisional = None
+            self._untrack(item)
+            self._unfinished_tasks += 1
+            return item.payload
+        else:
             raise asyncio.QueueEmpty()
-        item = self._items.popleft()
-        self._untrack(item)
-        self._unfinished_tasks += 1
-        return item.payload
 
     def put_nowait(self, raw_message: str) -> None:
         """Generic enqueue for initial HISTORY and control messages."""
@@ -426,11 +443,25 @@ class CoalescingQueue:
         revision: int,
         is_final: bool,
         payload: str,
+        slow_mode: bool = False,
     ) -> bool:
         """Non-blocking semantic enqueue for caption updates. Returns False if hard ceiling exceeded."""
-        # 1. IN-PLACE COALESCING: Only under strain, replace an unsent provisional revision for this segment.
+        # 0. ACTIVE PROVISIONAL MANAGEMENT:
+        # If the dedicated active provisional slot holds this segment, update or clear it.
+        if self._active_provisional is not None and self._active_provisional.segment == segment:
+            if is_final:
+                # Segment finalized: active provisional is superseded by the final caption
+                self._active_provisional = None
+            else:
+                # Newer provisional revision replaces the active provisional in place
+                self._active_provisional.revision = revision
+                self._active_provisional.payload = payload
+                self._active_provisional.enqueued_at = time.time()
+                return True
+
+        # 1. IN-PLACE COALESCING: Only under strain or slow mode, replace an unsent provisional revision for this segment.
         # A healthy client keeps every revision, even when a burst queues several before its sender runs.
-        if segment in self._provisional_map and self.is_strained():
+        if segment in self._provisional_map and (self.is_strained() or slow_mode):
             pending = self._provisional_map[segment]
             pending.revision = revision
             pending.final = is_final
@@ -455,6 +486,13 @@ class CoalescingQueue:
             return True
 
         # 3. PROVISIONAL CAPTIONS:
+        # Under slow mode: Do not fill queue with intermediate provisional revisions;
+        # preserve the latest revision of the active segment in the dedicated slot.
+        if slow_mode:
+            self._active_provisional = PendingItem(segment, revision, False, payload)
+            self._ready.set()
+            return True
+
         # Normal operation: Queue is healthy and not strained, preserve full revision stream
         if not self.is_strained():
             item = PendingItem(segment, revision, False, payload)
@@ -467,7 +505,10 @@ class CoalescingQueue:
             if len(self._items) >= self.maxsize:
                 # Evict an older provisional update to make room
                 if not self._evict_oldest_provisional():
-                    # If entire queue is full of finals, drop this provisional revision
+                    # If entire queue is full of finals, preserve latest revision of the
+                    # active segment in the dedicated slot rather than dropping it.
+                    self._active_provisional = PendingItem(segment, revision, False, payload)
+                    self._ready.set()
                     return True
             item = PendingItem(segment, revision, False, payload)
             self._items.append(item)
@@ -615,16 +656,12 @@ def enqueue_live_update(
         if client.closing or client.session != session:
             continue
 
-        # A slow reader would read a provisional seconds after its final exists; spend its
-        # limited reads on final captions instead
-        if not is_final and client.slow_mode:
-            continue
-
         ok = client.queue.enqueue_caption(
             segment=segment,
             revision=revision,
             is_final=is_final,
             payload=raw_message,
+            slow_mode=client.slow_mode,
         )
 
         if not ok:

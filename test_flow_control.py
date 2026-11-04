@@ -155,6 +155,59 @@ class TestFlowControl(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("provisional", self.ws.sent)
         self.assertEqual(self.ws.sent[-1], "final")
 
+    async def test_slow_mode_preserves_latest_active_provisional(self):
+        """Under slow mode, latest active provisional is preserved and delivered before finalization."""
+        await self.start()
+        CLIENTS.add(self.client)
+        await self.learn_rtt(0.010)
+
+        # Trigger slow mode
+        await self.send_one(MIN_RTT_SAMPLES + 1, 2.0)
+        self.assertTrue(self.client.slow_mode)
+
+        seg = MIN_RTT_SAMPLES + 2
+        # Send provisional rev 1 then rev 2 for active segment
+        enqueue_live_update("L1", seg, 1, False, "seg_active_rev1")
+        enqueue_live_update("L1", seg, 2, False, "seg_active_rev2")
+
+        # Drain: rev 2 (latest available revision) must be delivered, rev 1 suppressed
+        await self.pong_until_drained(0.010)
+        self.assertNotIn("seg_active_rev1", self.ws.sent)
+        self.assertIn("seg_active_rev2", self.ws.sent)
+
+        # Later, segment finalizes
+        enqueue_live_update("L1", seg, 3, True, "seg_active_final")
+        await self.pong_until_drained(0.010)
+        self.assertEqual(self.ws.sent[-1], "seg_active_final")
+
+    async def test_slow_mode_active_provisional_cleared_by_final_when_flow_blocked(self):
+        """When flow-blocked in slow mode, finalization clears obsolete provisional so it is never sent."""
+        await self.start()
+        CLIENTS.add(self.client)
+        await self.learn_rtt(0.010)
+
+        # Trigger slow mode
+        await self.send_one(MIN_RTT_SAMPLES + 1, 2.0)
+        self.assertTrue(self.client.slow_mode)
+
+        # Exhaust flow window with finals
+        for i in range(FLOW_WINDOW):
+            self.client.queue.enqueue_caption(100 + i, 1, True, f"blocked_final_{i}")
+        await self.settle()
+        self.assertTrue(self.client.sent - self.client.acked >= FLOW_WINDOW)
+
+        # Active provisional arrives while window is full
+        seg = MIN_RTT_SAMPLES + 2
+        enqueue_live_update("L1", seg, 1, False, "unseen_provisional")
+
+        # Segment finalizes before any pong arrives
+        enqueue_live_update("L1", seg, 2, True, "seen_final")
+
+        # Now drain
+        await self.pong_until_drained(0.010)
+        self.assertNotIn("unseen_provisional", self.ws.sent)
+        self.assertIn("seen_final", self.ws.sent)
+
     async def test_lost_packet_delay_is_not_slow(self):
         """A few round trips of extra delay (a retransmitted packet) does not enter slow mode."""
         await self.start()
